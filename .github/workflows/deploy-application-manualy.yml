@@ -1,0 +1,192 @@
+name: manualy-deploy-docker-img-from-docker-hub # 3
+
+on:
+  workflow_run:
+    workflows: ["deploying-aws-Infrastructure-with-terraform"]
+    types: [completed]
+
+  workflow_dispatch:   
+
+jobs:
+    retrieve_ec2_instance_id:
+      name: Extract EC2 instance ID for JSON file
+      runs-on: ubuntu-latest
+      # if: github.event_name == 'workflow_dispatch'
+     
+      permissions:
+        id-token: write    # Required for AWS OIDC
+        contents: read     # Required to checkout code
+        actions: read      # Required to download artifacts from other runs
+      env:
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        # EC2_INSTANCE_ID: ${{ needs.terraform_deploy_aws_resources.outputs.instance_id }}
+
+      steps:
+        - name: Checkout Repository Code
+          uses: actions/checkout@v4
+
+        - name: Get Latest Workflow Run ID
+          env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          run: |
+            RUN_ID=$(gh run list --workflow "deploying-aws-Infrastructure-with-terraform" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+  
+            # Check if RUN_ID is empty or "null"
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" == "null" ]; then
+              echo "::error::No successful runs of 'deploying-aws-Infrastructure-with-terraform' found. Please run deploying-aws-Infrastructure-with-terraform first."
+              exit 1
+            fi
+  
+            echo "LATEST_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+            echo "Found Run ID; $RUN_ID"
+        
+
+        - name: Download artifact
+          uses: actions/github-script@v8
+          with:
+            script: |
+              console.log('process.env.LATEST_RUN_ID:', process.env.LATEST_RUN_ID)
+              const run_id = Number(process.env.LATEST_RUN_ID);
+
+              let allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run_id,
+              });
+
+              console.log('allArtifacts: ',allArtifacts)
+
+
+              let matchArtifact = allArtifacts.data.artifacts.filter((artifact) => {
+                return artifact.name == "ec2_instance.json"
+              })[0];
+
+              console.log('matchArtifact: ',matchArtifact)
+
+              let downloadArtifact = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: matchArtifact.id,
+                archive_format: 'zip',
+              });
+
+              console.log('downloadArtifact: ',downloadArtifact)
+        
+              let fs = require('fs');
+              fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/ec2_instance.zip`, Buffer.from(downloadArtifact.data));
+
+        - name: Unzip artifact
+          run: |
+            pwd
+            ls 
+            unzip -o ec2_instance.zip
+
+        - name: Return parsed JSON
+          uses: actions/github-script@v8
+          id: return_parsed_json
+          with:
+            script: |
+              let fs = require('fs');
+              let data = fs.readFileSync('./tr_src/ec2_instance.json', 'utf8');
+              return JSON.parse(data);
+        
+
+      outputs:
+        EC2_INSTANCE_ID: ${{ fromJSON(steps.return_parsed_json.outputs.result).ec2_instance_id }} 
+        # AWS_REGION: ${{ fromJSON(steps.return_parsed_json.outputs.result).aws_region }}
+
+    deploy-docker-image-from-docker-hub:
+      name: Deploy Docker to EC2
+      
+      permissions:
+        id-token: write   
+        contents: read    
+        issues: write
+        pull-requests: write
+  
+      needs:
+        -  retrieve_ec2_instance_id
+      runs-on: ubuntu-latest
+      steps:
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+            aws-region: ${{ secrets.AWS_REGION }}
+
+        - name: Log Context Values
+          run: |
+            echo "EC2_INSTANCE_ID; ${{ needs.retrieve_ec2_instance_id.outputs.EC2_INSTANCE_ID }}"
+            echo "AWS_REGION; ${{ secrets.AWS_REGION }}"
+        
+        - name: Deploy Nginx via SSM (Clean Version)
+          run: |
+              COMMAND=$(cat <<EOF
+              sudo apt update -y
+              sudo apt install -y nginx
+              sudo tee /var/www/html/index.html <<HTML
+              <!DOCTYPE html>
+              <html>
+              <body>
+                <h1>Hello From Ubuntu EC2 Instance!!!</h1>
+                <p>Setup by Terraform and GitHub Actions.</p>
+                <p>AWS_REGION: ${{ secrets.AWS_REGION }} .</p>
+                <p>EC2_INSTANCE_ID: ${{ needs.retrieve_ec2_instance_id.outputs.EC2_INSTANCE_ID }}.</p>
+              </body>
+              </html>
+              HTML
+              sudo systemctl restart nginx
+              EOF
+              )
+    
+              aws ssm send-command \
+                --instance-ids "${{ needs.retrieve_ec2_instance_id.outputs.EC2_INSTANCE_ID }}" \
+                --document-name "AWS-RunShellScript" \
+                --parameters "commands=[$COMMAND]" \
+                --region ${{ secrets.AWS_REGION }}
+
+    # terraform_destroy:
+    #   name: Terraform Destroy
+    #   runs-on: ubuntu-latest
+    #   needs: [ retrieve_ec2_instance_id, deploy-docker-image-from-docker-hub ]
+
+    #   permissions:
+    #     id-token: write # Required for requesting the JWT
+    #     contents: read  # Required for actions/checkout
+
+    #   steps:
+    #     - run: echo "All CI jobs completed successfully."
+
+    #     - name: Checkout Code
+    #       uses: actions/checkout@v4
+        
+    #     - name: Download artifact
+    #       uses: actions/download-artifact@v4
+    #       with:
+    #         # name: ec2_instance.json 
+    #         # run-id: ${{ github.event.workflow_run.id }}
+    #         github-token: ${{ secrets.GITHUB_TOKEN }}
+    #         path: . # Or your build directory
+      
+    #     - name: Check files artifact downloaded from ec2_instance.json
+    #       run: | 
+    #           echo "Final 2-artifact-build-data Status:"
+    #           pwd
+    #           ls -R
+
+    #     - name: Configure AWS Credentials
+    #       uses: aws-actions/configure-aws-credentials@v4
+    #       with:
+    #         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+    #         aws-region: ${{ secrets.AWS_REGION }}
+
+    #     - name: Setup Terraform
+    #       uses: hashicorp/setup-terraform@v3
+    #       with:
+    #         terraform_version: "1.7.0" # Or your preferred version
+
+    #     - name: Terraform Init
+    #       run: terraform init
+
+    #     - name: Terraform Destroy 
+    #       run: terraform destroy -auto-approve
