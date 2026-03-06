@@ -3,7 +3,7 @@ name: ci-pipeline
 on:
   push:
     branches:
-      - cicd_multistage
+      - dev
   pull_request:
     branches:
       - main
